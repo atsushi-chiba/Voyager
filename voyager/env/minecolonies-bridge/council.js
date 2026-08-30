@@ -63,7 +63,10 @@ const LLM_PORT = parseInt(process.env.LLM_PORT || "11434", 10);
 const MODEL = process.env.LLM_MODEL || "gemma4:e4b";
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
-const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
+// Keep the console pipe configurable because the server location differs
+// between deployments.  The current mine-server installation lives under
+// mine-admin's home directory.
+const CMD_PIPE = process.env.CMD_PIPE || "/home/mine-admin/mc-server-forge/cmd_pipe";
 const COLONY_ID = parseInt(process.env.COLONY_ID || "1", 10);
 // Infinity = resident daemon. The 300-cycle cap predates the colony_watch
 // supervisor; with the cap, council exited every ~75min and the watch's
@@ -77,12 +80,11 @@ const TURN_DELAY_MS = 2000;
 const CYCLE_DELAY_MS = 15000;
 const CITIZEN_VOICE_EVERY = 1;
 
-// 通常ワールド移行対応(2026-07-11): env で上書き可。未設定なら旧スーパーフラット
-// 基盤コロニーの値(200,-60,200)を維持するので既存挙動は不変。
+// env で上書き可。未設定時は、スポーン地点からすぐ観察できる原点を使う。
 const ANCHOR = {
-  x: parseInt(process.env.ANCHOR_X ?? "200", 10),
+  x: parseInt(process.env.ANCHOR_X ?? "0", 10),
   y: parseInt(process.env.ANCHOR_Y ?? "-60", 10),
-  z: parseInt(process.env.ANCHOR_Z ?? "200", 10),
+  z: parseInt(process.env.ANCHOR_Z ?? "0", 10),
 };
 
 const GOVERNORS = [
@@ -98,11 +100,63 @@ const GOVERNORS = [
   },
 ];
 
+// Shared, cross-governor memory.  A governor's private `history` only contains
+// its own previous turns, so this log is the causal bridge between agents: it
+// carries both what everybody said and what the governors actually did.
+// Keep it bounded because council.js normally runs as a resident daemon.
 const sharedChatLog = [];
+const SHARED_LOG_LIMIT = 80;
+
+function rememberSharedEvent(event) {
+  sharedChatLog.push({ ...event, t: event.t || Date.now() });
+  if (sharedChatLog.length > SHARED_LOG_LIMIT) {
+    sharedChatLog.splice(0, sharedChatLog.length - SHARED_LOG_LIMIT);
+  }
+}
+
+function renderSharedCouncilContext(events = sharedChatLog, limit = 12) {
+  const recent = events.slice(-limit);
+  if (recent.length === 0) return "（まだ会話なし）";
+  return recent.map((event) => {
+    if (event.kind === "action") {
+      const outcome = event.effective === false ? `INEFFECTIVE(${event.status})` : event.status;
+      return `${event.who}の行動: ${event.label} -> ${outcome} ${event.result || ""}`.trim();
+    }
+    return `${event.who}: ${event.text}`;
+  }).join(" | ");
+}
+
+function actionKey(action) {
+  return JSON.stringify(action);
+}
+
+// A bridge endpoint can return HTTP 200 while reporting that no state change
+// occurred (for example a blueprint that did not become pending).  Letting the
+// same stale candidate remain at priority 1 traps both governors in a loop.
+// Remove only actions whose *latest* shared result was ineffective; `wait` is
+// retained as a safe fallback. A changed live candidate naturally gets a new
+// key and becomes available immediately.
+function filterRecentlyIneffectiveCandidates(candidates, events = sharedChatLog, limit = 12) {
+  const latest = new Map();
+  for (const event of events.slice(-limit).reverse()) {
+    if (event.kind !== "action" || !event.action) continue;
+    const key = actionKey(event.action);
+    if (!latest.has(key)) latest.set(key, event.effective !== false);
+  }
+  return candidates.filter((candidate) => {
+    if (candidate.action?.action === "wait") return true;
+    return latest.get(actionKey(candidate.action)) !== false;
+  });
+}
+
+function actionResultWasEffective(res) {
+  if (res.status < 200 || res.status >= 300) return false;
+  return !/\[WARN:\s*not pending after requestUpgrade/i.test(String(res.body));
+}
 
 function sayInGame(name, message) {
   const safe = String(message).replace(/"/g, "'").slice(0, 200);
-  sharedChatLog.push({ who: name, text: safe, t: Date.now() });
+  rememberSharedEvent({ kind: "speech", who: name, text: safe });
   try {
     // O_NONBLOCK: if the server isn't reading from cmd_pipe (no reader on the
     // FIFO), writeFileSync blocks forever. Non-blocking open throws ENXIO
@@ -161,7 +215,7 @@ function extractFirstJSON(text) {
 const GOVERNOR_REPLY_SCHEMA = {
   type: "object",
   properties: {
-    say: { type: "string" },
+    say: { type: "string", maxLength: 40 },
     choice: { type: "integer" },
   },
   required: ["say", "choice"],
@@ -354,6 +408,15 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       0,
       ...buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).map((b) => b.level)
     );
+    const operationalBuilders = buildings.filter(
+      (b) => b.type === "blockhutbuilder" && b.operational
+    );
+    const builderCanReach = (target) => operationalBuilders.some((builder) => {
+      const dx = Number(builder.x) - Number(target.x);
+      const dy = Number(builder.y) - Number(target.y);
+      const dz = Number(builder.z) - Number(target.z);
+      return dx * dx + dy * dy + dz * dz <= 100 * 100;
+    });
     // Progression = town-hall level (MineColonies: buildings can't exceed it, it
     // caps colony size, gates research). It is the axis for "how much" (count)
     // and "how deep" (level) targets.
@@ -384,6 +447,15 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     const pendingCount = buildings.filter((b) => b.pending).length;
     const builderCount = Math.max(1, buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).length);
     const backlogFull = pendingCount >= builderCount * 3;
+    // A placed level-0 hut is already construction backlog even before it has
+    // a Work Order. Do not place another building until each buildable shell
+    // has at least been submitted. The old pending-only gate let the mayor
+    // place one of every type while pending stayed false.
+    const awaitingBuildOrder = buildings.some(
+      (b) => !b.operational && b.level === 0 && !b.pending &&
+        b.inTerritory && !researchLocked(b.type) &&
+        (operationalBuilders.length === 0 || builderCanReach(b))
+    );
     for (const b of buildings) {
       if (backlogFull) break;
       if (b.pending || !b.inTerritory) continue;
@@ -391,6 +463,11 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         // Research-locked shell: requestBuild would just error. Don't offer it
         // (and flag the block so University gets prioritized to unlock it).
         if (researchLocked(b.type)) { researchBlockedPending = true; continue; }
+        // The Bridge remains the source of truth and still rejects out-of-range
+        // builds. Filtering the same known-invalid choice here prevents the LLM
+        // from spending every turn retrying it. With no operational builder we
+        // fail open so bootstrap behavior remains available.
+        if (operationalBuilders.length > 0 && !builderCanReach(b)) continue;
         candidates.push({
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
@@ -459,7 +536,7 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     // not just when population already overflows - otherwise pop lags the job
     // slots and workplaces stay empty. Freeze still applies when too many are
     // jobless (housing running ahead of actually-filled jobs).
-    if (housing < targetPop && !backlogFull && !housingFrozen) {
+    if (housing < targetPop && !backlogFull && !awaitingBuildOrder && !housingFrozen) {
       candidates.push({
         label: `placeNext minecolonies:blockhutcitizen(住居の新設。容量${housing}<目標${targetPop}[就労建物${jobBuildings}]なので最優先級)`,
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
@@ -475,7 +552,7 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     // (housing) has its own pop>housing path above and is excluded here.
     // (Before this, every unbuilt type was an equal shuffled option, so gemma
     // placed luxury buildings as readily as farms - 2026-07-11.)
-    if (!backlogFull) {
+    if (!backlogFull && !awaitingBuildOrder) {
       const tierOf = (v) => (typeof v.tier === "number" ? v.tier : 4);
       // "wanted by count" ignoring the research gate - used to detect types the
       // mayor would place if the research were done (drives University-first).
@@ -658,7 +735,9 @@ function buildGovernorSystemPrompt(gov) {
 async function governorTurn(gov, history, status) {
   const researchNeeds = await getResearchNeeds();
   const demand = readDemand();
-  const candidates = buildCandidates(status, researchNeeds, demand.rank);
+  const candidates = filterRecentlyIneffectiveCandidates(
+    buildCandidates(status, researchNeeds, demand.rank)
+  );
   const menu = candidates.map((c, i) => `${i}: ${c.label}`).join("\n");
   // Pre-computed hints: small models don't reliably derive these from the
   // raw status JSON, and the housing deficit drives the top-priority rule.
@@ -676,12 +755,9 @@ async function governorTurn(gov, history, status) {
   }
   // Anchor hint follows the live colony center so it stays correct after a
   // colony_watch restart that doesn't pass ANCHOR_* env (normal-world colonies
-  // are founded at their real terrain coords, not the old 200,-60,200 default).
+  // are founded at their real terrain coords, not the configured default).
   const anc = colony ? { x: colony.x, y: colony.y, z: colony.z } : ANCHOR;
-  const userMsg = `[STATE] anchor ${anc.x},${anc.y},${anc.z}\ncolonies: ${JSON.stringify(status)}${hint}\n直近の会話: ${sharedChatLog
-    .slice(-8)
-    .map((c) => `${c.who}: ${c.text}`)
-    .join(" | ")}\n[ACTIONS] 次の行動を1つ選び {"say":"<日本語で40文字以内の短い一言>","choice":<番号>} で答えること。sayに分析や長文を書かない:\n${menu}`;
+  const userMsg = `[STATE] anchor ${anc.x},${anc.y},${anc.z}\ncolonies: ${JSON.stringify(status)}${hint}\n[COUNCIL MEMORY] ${renderSharedCouncilContext()}\n直前の他の統治者の発言に提案・要望があれば、安全性と優先ルールに反しない限りchoiceに反映すること。反映しない場合はsayで短く理由を返すこと。\n[ACTIONS] 次の行動を1つ選び {"say":"<日本語で40文字以内の短い一言>","choice":<番号>} で答えること。sayに分析や長文を書かない:\n${menu}`;
   history.push({ role: "user", content: userMsg });
 
   let reply;
@@ -706,7 +782,7 @@ async function governorTurn(gov, history, status) {
     return;
   }
 
-  if (parsed.say) sayInGame(gov.name, String(parsed.say).slice(0, 60));
+  if (parsed.say) sayInGame(gov.name, String(parsed.say).slice(0, 40));
   else console.log(`[${gov.name}] reply missing say:`, jsonStr.slice(0, 200));
 
   const idx =
@@ -717,19 +793,58 @@ async function governorTurn(gov, history, status) {
   try {
     const res = await runGovernorAction(chosen.action);
     console.log(`[${gov.name}] choice ${idx} (${chosen.label}) ->`, res.status, res.body);
+    const effective = actionResultWasEffective(res);
+    rememberSharedEvent({
+      kind: "action",
+      who: gov.name,
+      label: chosen.label,
+      action: chosen.action,
+      status: res.status,
+      effective,
+      result: String(res.body).slice(0, 150),
+    });
     // Feed the outcome back into this governor's history - otherwise errors
     // (level gates, no space, research gates) are invisible and the model
     // keeps repeating the same failing choice.
     history.push({ role: "user", content: `[RESULT] ${chosen.label} -> ${res.status} ${String(res.body).slice(0, 150)}` });
   } catch (e) {
     console.log(`[${gov.name}] action failed:`, e.message);
+    rememberSharedEvent({
+      kind: "action",
+      who: gov.name,
+      label: chosen.label,
+      action: chosen.action,
+      status: "ERROR",
+      effective: false,
+      result: String(e.message).slice(0, 150),
+    });
   }
 }
 
 async function runGovernorAction(action) {
   switch (action.action) {
-    case "placeNext":
-      return httpRequest("POST", `/placeNext?block=${encodeURIComponent(action.block)}&colonyId=${action.colonyId || COLONY_ID}`);
+    case "placeNext": {
+      const placed = await httpRequest(
+        "POST",
+        `/placeNext?block=${encodeURIComponent(action.block)}&colonyId=${action.colonyId || COLONY_ID}`
+      );
+      if (placed.status < 200 || placed.status >= 300) return placed;
+      const pos = parsePlacedPosition(placed.body);
+      if (!pos) return placed;
+      // Placement and construction are separate MineColonies operations. Once
+      // the LLM has chosen the building type, submitting that exact hut for
+      // construction is deterministic bookkeeping, not another policy choice.
+      // Doing it here prevents an unbuilt shell from depending on a later LLM
+      // turn where the model may incorrectly choose wait.
+      const requested = await httpRequest(
+        "POST",
+        `/requestBuild?x=${pos.x}&y=${pos.y}&z=${pos.z}`
+      );
+      return {
+        status: requested.status,
+        body: `${placed.body} auto-requestBuild=${requested.body}`,
+      };
+    }
     case "place":
       return httpRequest("POST", `/place?x=${action.x}&y=${action.y}&z=${action.z}&block=${encodeURIComponent(action.block)}`);
     case "found":
@@ -750,6 +865,12 @@ async function runGovernorAction(action) {
     default:
       throw new Error("Unknown action: " + JSON.stringify(action));
   }
+}
+
+function parsePlacedPosition(body) {
+  const match = String(body).match(/\[pos:(-?\d+),(-?\d+),(-?\d+)\]/);
+  if (!match) return null;
+  return { x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) };
 }
 
 // ---------- Citizen voice ----------
@@ -835,7 +956,11 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-module.exports = { askLLM, buildGovernorSystemPrompt, extractFirstJSON, buildCandidates, GOVERNORS, MODEL, GOVERNOR_REPLY_SCHEMA };
+module.exports = {
+  askLLM, buildGovernorSystemPrompt, extractFirstJSON, buildCandidates,
+  parsePlacedPosition, renderSharedCouncilContext,
+  filterRecentlyIneffectiveCandidates, GOVERNORS, MODEL, GOVERNOR_REPLY_SCHEMA,
+};
 
 if (require.main === module) {
   main().catch((e) => console.error("FATAL", e));
