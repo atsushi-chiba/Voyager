@@ -5,7 +5,7 @@ description: LLM市長(council.js)の設計・調整・運用ガイド。市長�
 
 # LLM市長システム(council.js)ランブック
 
-`/root/Voyager/voyager/env/minecolonies-bridge/council.js` が本体。ローカル ollama
+`voyager/env/minecolonies-bridge/council.js` が本体。ローカル ollama
 (192.168.15.150:11434 / gemma4:e4b)で複数の「統治者(governor)」ペルソナが合議して
 コロニーの建設判断を下し、同時に各市民が短い在職セリフを喋る。全発言はサーバー
 コンソール `say` 経由でゲーム内チャットに出る。**council.js は Minecraft に bot として
@@ -30,7 +30,9 @@ gemma級のモデルは**自由記述のaction JSONを作れない**(action名�
 | ガバナー | 内容 | 理由 |
 |---|---|---|
 | **spawn-gate** | 住居に空きがある時だけ spawnCitizen を提示 | 毎ターン選んで人口暴走するため |
-| **backlog** | 建設待ち ≥ 稼働builder×3 の間、建設候補を全消去 | builderが捌ける以上に発注するため |
+| **backlog** | 未着工のlv0ハットがあれば追加配置を止めて着工を優先。建設中 ≥ 稼働builder×3 でも新規建設を止める | pendingになる前の空ハットを大量配置した事故と、builderが捌ける以上の発注を防ぐため |
+| **builder距離** | 稼働builderがいる時は全hutから100ブロック圏外の着工候補をメニューから除外 | Bridgeの正当な距離拒否へLLMが固執するのを防ぐため |
+| **配置後の自動着工** | LLMが`placeNext`で建物種を選んだら、返却座標へ同じ処理内で`requestBuild`する | 置いた後の別ターンでLLMが`wait`を選び、空ハットが残るのを防ぐため |
 | **dedup** | placeNext は「コロニーに無いタイプ」のみ提示 | 同型を無限に建てるため(38 alchemist) |
 | **maxLevel** | `b.maxLevel`(getMaxBuildingLevel)超のupgradeを除外 | tavern lv3・postbox lv1 等の無意味upgrade |
 | **shuffle** | wait以外の候補順をランダム化 | e4bの低番号位置バイアス(先頭のalchemistを常に選んだ) |
@@ -66,14 +68,21 @@ council.js 側の `.replace()` も足すこと。
 
 ## 運用(起動・監視・再起動)
 
+`council.js` のゲーム内発言は `CMD_PIPE` 環境変数で指定した FIFO へ書く。未指定時は
+現行 mine-server 配置の `/home/mine-admin/mc-server-forge/cmd_pipe` を使う。Forge 側も
+同じ FIFO を標準入力として読む必要があるため、現行配置では直接 `run.sh` を起動せず
+`/home/mine-admin/mc-server-forge/start_server.sh` を使う。
+
 ```bash
 # 再起動(必ずサブシェル内cd。裸起動は即死)
 pkill -f 'node council\.js$'; sleep 2
-(cd /root/Voyager/voyager/env/minecolonies-bridge && setsid nohup node council.js >> council5.log 2>&1 &)
+(cd /home/mine-admin/Voyager/voyager/env/minecolonies-bridge && \
+  setsid -f env CMD_PIPE=/home/mine-admin/mc-server-forge/cmd_pipe \
+  node council.js >> council5.log 2>&1 </dev/null)
 # 稼働確認(ちょうど1プロセス)
 pgrep -fc 'node council\.js$'
 # 挙動確認(統治者の choice と say が出る)
-tail -f /root/Voyager/voyager/env/minecolonies-bridge/council5.log
+tail -f /home/mine-admin/Voyager/voyager/env/minecolonies-bridge/council5.log
 ```
 
 - **常駐化済み**(MAX_CYCLES=Infinity)。colony_watch が異常死時のみ自動再起動
